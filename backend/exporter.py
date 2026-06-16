@@ -1,49 +1,90 @@
-import csv
 import io
 import logging
-from datetime import datetime
-from pathlib import Path
 from typing import List, Dict
 
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, fills
+from openpyxl.styles import Font, PatternFill, Alignment
 
 logger = logging.getLogger(__name__)
 
+
 IMDB_COLUMNS = [
-    "record_id",
-    "barcode",
-    "category_type",
-    "segment_type",
-    "manufacturer",
-    "brand",
-    "product_name",
-    "weight_unit",
-    "packaging_type",
-    "country_origin",
-    "marketing_message",
-    "confidence",
-    "flagged_for_review",
-    "potential_duplicate",
-    "notes",
-    "source_filename",
+    "ITEM_NAME",
+    "BARCODE",
+    "MANUFACTURER",
+    "BRAND",
+    "WEIGHT",
+    "PACKAGING_TYPE",
+    "COUNTRY",
+    "VARIANT",
+    "TYPE",
+    "FRAGRANCE_FLAVOR",
+    "PROMOTION",
+    "ADDONS",
+    "TAGLINE",
 ]
 
-_SKIP_IN_LOOP = {"confidence", "flagged_for_review", "potential_duplicate", "notes", "source_filename", "record_id"}
+FIELD_MAP = {
+    "ITEM_NAME":        "product_name",
+    "BARCODE":          "barcode",
+    "MANUFACTURER":     "manufacturer",
+    "BRAND":            "brand",
+    "WEIGHT":           "weight_unit",
+    "PACKAGING_TYPE":   "packaging_type",
+    "COUNTRY":          "country_origin",
+    "VARIANT":          "variant",
+    "FRAGRANCE_FLAVOR": "fragrance_flavor",
+    "PROMOTION":        "promotion",
+    "ADDONS":           "addons",
+    "TAGLINE":          "tagline",
+}
+
+
+def _resolve_type(rec: Dict) -> str:
+    """TYPE = combination of category_type + segment_type."""
+    segment = (rec.get("segment_type") or "").strip()
+    category = (rec.get("category_type") or "").strip()
+    if segment and category:
+        return f"{category} - {segment}" if segment.lower() != category.lower() else category
+    return segment or category or ""
+
+
+def _resolve_promo_fields(rec: Dict) -> Dict[str, str]:
+    """
+    PROMOTION / ADDONS / TAGLINE — if these specific fields are empty
+    but marketing_message has content, use it as a TAGLINE fallback
+    so the info isn't silently dropped.
+    """
+    promotion = (rec.get("promotion") or "").strip()
+    addons    = (rec.get("addons") or "").strip()
+    tagline   = (rec.get("tagline") or "").strip()
+    marketing = (rec.get("marketing_message") or "").strip()
+
+    if not (promotion or addons or tagline) and marketing:
+        tagline = marketing
+
+    return {"PROMOTION": promotion, "ADDONS": addons, "TAGLINE": tagline}
 
 
 def records_to_dataframe(records: List[Dict]) -> pd.DataFrame:
+    """Convert internal pipeline records into the 13-column hackathon DataFrame."""
     rows = []
     for rec in records:
-        row = {col: rec.get(col, "") for col in IMDB_COLUMNS if col not in _SKIP_IN_LOOP}
-        row["record_id"] = rec.get("record_id", "")
-        row["confidence"] = rec.get("confidence", 100)
-        row["flagged_for_review"] = "Yes" if rec.get("flagged_for_review") else "No"
-        row["potential_duplicate"] = "Yes" if rec.get("potential_duplicate") else "No"
-        row["notes"] = rec.get("notes", "")
-        row["source_filename"] = rec.get("source_filename", "")
+        row = {}
+
+        for hackathon_col, internal_key in FIELD_MAP.items():
+            if hackathon_col in ("TYPE", "PROMOTION", "ADDONS", "TAGLINE"):
+                continue
+            row[hackathon_col] = str(rec.get(internal_key, "") or "")
+
+        row["TYPE"] = _resolve_type(rec)
+        row.update(_resolve_promo_fields(rec))
+
+        for col in IMDB_COLUMNS:
+            row.setdefault(col, "")
+
         rows.append(row)
+
     return pd.DataFrame(rows, columns=IMDB_COLUMNS)
 
 
@@ -51,28 +92,15 @@ def export_to_excel(records: List[Dict], filename: str = None) -> bytes:
     df = records_to_dataframe(records)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="IMDB Import")
-        worksheet = writer.sheets["IMDB Import"]
+        df.to_excel(writer, index=False, sheet_name="Predictions")
+        worksheet = writer.sheets["Predictions"]
+
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF")
         for cell in worksheet[1]:
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", wrap_text=True)
-        # Row colouring: orange = flagged for review, yellow = potential duplicate
-        flag_fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
-        dup_fill  = PatternFill(start_color="F4B183", end_color="F4B183", fill_type="solid")
-        flag_col = IMDB_COLUMNS.index("flagged_for_review") + 1
-        dup_col  = IMDB_COLUMNS.index("potential_duplicate") + 1
-        for row in worksheet.iter_rows(min_row=2):
-            is_flagged = row[flag_col - 1].value == "Yes"
-            is_dup     = row[dup_col - 1].value == "Yes"
-            if is_dup:
-                for cell in row:
-                    cell.fill = dup_fill
-            elif is_flagged:
-                for cell in row:
-                    cell.fill = flag_fill
 
         for column in worksheet.columns:
             max_length = 0
@@ -84,6 +112,7 @@ def export_to_excel(records: List[Dict], filename: str = None) -> bytes:
                 except Exception:
                     pass
             worksheet.column_dimensions[col_letter].width = min(max_length + 4, 50)
+
     return output.getvalue()
 
 

@@ -6,3 +6,6 @@ storage/.DS_Store
 storage/google_credentials.json
 storage/venv/
 storage/__pycache__/
+node_modules/
+backend/google_credentials.json
+backend/.env
