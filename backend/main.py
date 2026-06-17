@@ -26,6 +26,15 @@ app = FastAPI(
     version="0.2.0",
 )
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"], 
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -208,3 +217,66 @@ async def validate_record(request: Request):
     record = await request.json()
     result = IMDBValidator.validate_record(record)
     return JSONResponse(result)
+
+@app.post("/api/extract-product")
+async def extract_product(files: List[UploadFile] = File(...)):
+    """Multiple images of the SAME product — merge into one record."""
+    if len(files) > 10:
+        raise HTTPException(400, "Maximum 10 images per product")
+
+    saved = []
+    for file in files:
+        if not file.content_type or not file.content_type.startswith("image/"):
+            continue
+        ext = Path(file.filename or "upload.jpg").suffix
+        dest = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
+        dest.write_bytes(await file.read())
+        saved.append(dest)
+
+    if not saved:
+        raise HTTPException(400, "No valid image files provided")
+
+    try:
+        # Gather OCR text from all images
+        ocr_parts = []
+        for path in saved:
+            try:
+                text = read_text_from_image(str(path))
+                if text:
+                    ocr_parts.append(text)
+            except Exception as exc:
+                logger.warning("OCR failed for %s: %s", path, exc)
+
+        combined_ocr = "\n".join(ocr_parts)
+
+        # Detect barcodes across all images, take first hit
+        barcode_value = ""
+        for path in saved:
+            barcodes = detect_barcodes(str(path))
+            if barcodes:
+                barcode_value = barcodes[0].get("data", "")
+                break
+
+        # Extract using the primary (first) image + all OCR text combined
+        data = extract_product_data(str(saved[0]), combined_ocr)
+
+        if barcode_value and not data.get("barcode"):
+            data["barcode"] = barcode_value
+
+        validation = IMDBValidator.validate_record(data)
+        data["confidence"] = validation["confidence"]
+        data["field_validation"] = validation["fields"]
+        data["flagged_for_review"] = validation["confidence"] < 60
+        data["notes"] = ""
+        data["image_count"] = len(saved)
+
+        store.add(data)
+        return JSONResponse(data)
+
+    except Exception as exc:
+        logger.exception("Product extraction failed")
+        raise HTTPException(500, f"Extraction failed: {exc}")
+    finally:
+        for path in saved:
+            path.unlink(missing_ok=True)
+
